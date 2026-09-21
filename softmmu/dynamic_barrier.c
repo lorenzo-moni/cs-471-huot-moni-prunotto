@@ -181,7 +181,7 @@ uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32
 
     dynamic_barrier_polling_acquire_lock(barrier);
 
-    uint32_t current_gen = atomic_load(&barrier->return_value.two_32.generation);
+    uint32_t current_gen = __atomic_load_n(&barrier->return_value.two_32.generation, __ATOMIC_SEQ_CST);
 
     assert(private_generation == current_gen);
 
@@ -286,7 +286,7 @@ uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32
 uint32_t dynamic_barrier_polling_increase_by_1(dynamic_barrier_polling_t *barrier) {
     uint32_t current_generation;
     dynamic_barrier_polling_acquire_lock(barrier);
-    current_generation = atomic_load(&barrier->return_value.two_32.generation);
+    current_generation = __atomic_load_n(&barrier->return_value.two_32.generation, __ATOMIC_SEQ_CST);
     barrier->threshold += 1;
     dynamic_barrier_polling_release_lock(barrier);
 
@@ -315,7 +315,7 @@ int dynamic_barrier_polling_decrease_by_1(dynamic_barrier_polling_t *barrier) {
         barrier->count = 0;
 
         // increase the generation and notify others.
-        atomic_fetch_add(&barrier->return_value.two_32.generation, 1);
+        __atomic_fetch_add(&barrier->return_value.two_32.generation, 1, __ATOMIC_SEQ_CST);
     }
 
     dynamic_barrier_polling_release_lock(barrier);
@@ -324,7 +324,7 @@ int dynamic_barrier_polling_decrease_by_1(dynamic_barrier_polling_t *barrier) {
 
 void dynamic_barrier_polling_reset(dynamic_barrier_polling_t *barrier) {
     dynamic_barrier_polling_acquire_lock(barrier);
-    atomic_store(&barrier->return_value.two_32.generation, 0); // this should make everyone to not wait.
+    __atomic_store_n(&barrier->return_value.two_32.generation, 0, __ATOMIC_SEQ_CST); // this should make everyone to not wait.
     barrier->count = 0;
     dynamic_barrier_polling_release_lock(barrier);
 }
