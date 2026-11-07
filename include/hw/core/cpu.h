@@ -494,6 +494,19 @@ struct CPUState {
     uint64_t sgi_sender_time_ns_valid;
     uint64_t sgi_sender_remaining_time_ns;
     uint64_t sgi_sender_quantum_generation;
+
+    /*
+     * Per-quantum counters for the qstats breakdown (see
+     * include/sysemu/quantum-stats.h). Accumulated during the quantum and
+     * reset by qstats_vcpu_end_quantum().
+     */
+    uint64_t qstats_insns;        // guest instructions executed in this quantum
+    int64_t  qstats_wfi_ps;       // simulated time given up in WFI/idle (ps)
+    uint64_t qstats_host_exec_ns; // host time spent in tcg_cpus_exec() for this vCPU
+    uint64_t qstats_bql_wait_ns;  // host time its thread waited for the BQL
+    uint32_t qstats_idle_entries; // number of times the vCPU went idle
+    bool     qstats_bql_on;       // time the BQL waits of this vCPU (set by qstats_vcpu_attach)
+    bool     qstats_paused;       // its thread blocked in qemu_wait_io_event() because it was stopped
 };
 
 typedef QTAILQ_HEAD(CPUTailQ, CPUState) CPUTailQ;

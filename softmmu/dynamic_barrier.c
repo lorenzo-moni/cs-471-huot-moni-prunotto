@@ -13,6 +13,7 @@
 #include "sysemu/cpus.h"
 #include "sysemu/runstate.h"
 #include "sysemu/quantum.h"
+#include "sysemu/quantum-stats.h"
 #include "qemu/plugin-pf.h"
 
 
@@ -188,6 +189,7 @@ uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32
     uint64_t waiting_count = barrier->count;
 
     if (waiting_count == barrier->threshold - 1) {
+        qstats_note_last_arriver();
         barrier->current_cycle += quantum_size;
         bool broadcast_stop_request = 0;
         barrier->count = 0;

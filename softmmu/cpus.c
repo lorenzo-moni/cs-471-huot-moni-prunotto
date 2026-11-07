@@ -48,7 +48,11 @@
 #include "trace.h"
 #include "qemu/dynamic_barrier.h"
 #include "sysemu/quantum.h"
+#include "sysemu/quantum-stats.h"
 #include "qemu/plugin-pf.h"
+
+/* qstats: installed by qstats_global_init() to account the BQL waits of vCPU threads. */
+void (*qstats_bql_wait_cb)(CPUState *cpu, uint64_t wait_ns);
 
 // This function is used to get the current clock of the CPU.
 // It is helpful when we want to know the current target clock.
@@ -456,6 +460,7 @@ void qemu_wait_io_event(CPUState *cpu)
             // The CPU has been stopped by the system (e.g., via pause_all_vcpus).
             // Wait until we're resumed.
             qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
+            cpu->qstats_paused = true; // qstats: do not account the paused time to a quantum.
             cpu->quantum_budget_in_picosecond = 0; // force entering the barrier.
             cpu->quantum_budget_depleted = 1;
         } else if (!cpu->stop) {
@@ -464,6 +469,11 @@ void qemu_wait_io_event(CPUState *cpu)
             if (affiliated_with_quantum) {
                 // record the idle time.
                 record_statistics_to_plugin(cpu->cpu_index, 4, cpu->quantum_budget_in_picosecond / 1000);
+                /* qstats: the unused budget is the simulated time spent in WFI. */
+                if (cpu->quantum_budget_in_picosecond > 0) {
+                    cpu->qstats_wfi_ps += cpu->quantum_budget_in_picosecond;
+                }
+                cpu->qstats_idle_entries++;
                 /*
                  * first_cpu is the timekeeper: bank the unused (idle) portion
                  * of its budget into the virtual clock so time keeps advancing
@@ -559,7 +569,14 @@ void qemu_mutex_lock_iothread_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock = qatomic_read(&qemu_bql_mutex_lock_func);
 
     g_assert(!qemu_mutex_iothread_locked());
-    bql_lock(&qemu_global_mutex, file, line);
+    if (unlikely(qstats_bql_wait_cb && current_cpu && current_cpu->qstats_bql_on)) {
+        /* qstats: time how long this vCPU thread waits for the BQL. */
+        uint64_t t0 = qstats_now_ns();
+        bql_lock(&qemu_global_mutex, file, line);
+        qstats_bql_wait_cb(current_cpu, qstats_now_ns() - t0);
+    } else {
+        bql_lock(&qemu_global_mutex, file, line);
+    }
     set_iothread_locked(true);
 }
 

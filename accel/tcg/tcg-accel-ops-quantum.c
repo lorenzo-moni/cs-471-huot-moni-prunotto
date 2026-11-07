@@ -43,6 +43,7 @@
 
 #include "qemu/dynamic_barrier.h"
 #include "sysemu/quantum.h"
+#include "sysemu/quantum-stats.h"
 #include <bits/time.h>
 #include <stdio.h>
 
@@ -74,58 +75,101 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
     async_run_on_cpu(cpu, do_nothing, RUN_ON_CPU_NULL);
 }
 
-static uint64_t get_current_timestamp_ns(void) {
-    struct timespec ts;
-    // Get the current time
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+/*
+ * Synchronization at the end of a quantum, split in two levels so that a
+ * host thread running several vCPUs (time multiplexing) can wait at the
+ * barrier once and then advance each of its vCPUs:
+ *
+ *   quantum_host_barrier_wait()  once per host thread per quantum
+ *   quantum_vcpu_advance()       once per vCPU per quantum
+ *
+ * With one vCPU per host thread, quantum_sync_to_next() calls both.
+ */
 
-    // Convert to nanoseconds
-    // tv_sec is seconds, tv_nsec is nanoseconds
-    uint64_t timestamp_ns = (uint64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+typedef enum {
+    QSYNC_NEXT,          /* the vCPU entered the next quantum */
+    QSYNC_STOPPED,       /* stop request: cpu_stop_current() has been called */
+    QSYNC_WOKEN_INSIDE,  /* woken inside the quantum (allow_interrupt_wakeup_inside) */
+} QSyncResult;
 
-    return timestamp_ns;
+/* Waits at the global barrier. Returns the new barrier generation. */
+static uint32_t quantum_host_barrier_wait(CPUState *cpu, int *stop_request)
+{
+    *stop_request = 0;
+    qstats_barrier_enter();
+    return dynamic_barrier_polling_wait(
+        &quantum_barrier,
+        cpu->quantum_generation,
+        stop_request,
+        cpu->touched_timer_during_last_quantum != 0
+    );
 }
 
-typedef struct {
-    uint64_t total_time;
-    uint64_t execution_time;
-    uint64_t waiting_time;
-    uint64_t idle_time;
-    uint64_t peeking_other_time;
-} per_cpu_host_time_breakdown_t;
+/* Moves @cpu to the next quantum after the barrier returned @new_generation. */
+static void quantum_vcpu_advance(CPUState *cpu, uint32_t new_generation,
+                                 int stop_request, bool from_idle)
+{
+    uint32_t old_generation_low_32bit = cpu->quantum_generation & 0xFFFFFFFF;
 
-const uint64_t RECORD_SIZE = 4096;
-const uint64_t SKIP_SIZE = 1000;
+    qstats_vcpu_end_quantum(cpu, cpu->quantum_generation);
 
-static void dump_log(CPUState *cpu, per_cpu_host_time_breakdown_t *statistics) {
-    // open a log file.
-    char log_name[100];
-    snprintf(log_name, 100, "qlog/statisitcs_%u.log", cpu->cpu_index);
+    if (stop_request != 2) {
+        assert(new_generation == old_generation_low_32bit + 1);
+        if (from_idle && cpu->quantum_budget_in_picosecond > 0) {
+            // this means the last quantum is not completely depleted. We need to deplete it before moving forward.
+            cpu->quantum_budget_in_picosecond = 0;
+        }
+        cpu->quantum_generation += 1;
+        /* Budget is always one quantum of simulated time in ps. */
+        cpu->quantum_budget_in_picosecond += (int64_t)quantum_size * 1000;
+        cpu->touched_timer_during_last_quantum = 0;
+        cpu->vts = cpu->quantum_generation * quantum_size;
+    } else {
+        // this means the vCPU quits due to the machine state change.
+        assert(new_generation == old_generation_low_32bit);
+        // clean the budget.
+        cpu->quantum_budget_in_picosecond = 0;
+        cpu->touched_timer_during_last_quantum = 1; // force updating the timer.
+        cpu->quantum_budget_depleted = 1;
+        cpu->quantum_generation += 1;
+        cpu->vts = cpu->quantum_generation * quantum_size;
+        assert(cpu->stop || cpu->stopped || !runstate_is_running());
+    }
+}
 
-    FILE *fp = fopen(log_name, "w");
+/*
+ * Ends the current quantum of @cpu: waits at the barrier and advances it.
+ * @from_idle: the vCPU is idle (WFI); its unused budget is dropped.
+ */
+static QSyncResult quantum_sync_to_next(CPUState *cpu, bool from_idle)
+{
+    uint32_t old_generation_low_32bit = cpu->quantum_generation & 0xFFFFFFFF;
+    uint64_t finished_generation = cpu->quantum_generation;
+    int stop_request = 0;
 
-    // push the enter_idle_time, target_cycle_on_idle, and target_cycle_on_instruction to the statistics.
-    fprintf(
-        fp,
-        "%lu,%lu,%lu\n",
-        cpu->enter_idle_time,
-        cpu->target_cycle_on_idle,
-        cpu->target_cycle_on_instruction
-    );
+    if (from_idle) {
+        cpu->sgi_sender_time_ns_valid = false;
+    }
+    cpu->waiting_for_quantum = 1;
+    uint32_t new_generation = quantum_host_barrier_wait(cpu, &stop_request);
+    cpu->waiting_for_quantum = 0;
 
-    for(uint64_t i = 0; i < RECORD_SIZE; ++i) {
-        fprintf(
-            fp,
-            "%lu,%lu,%lu,%lu,%lu\n",
-            statistics[i].total_time,
-            statistics[i].execution_time,
-            statistics[i].waiting_time,
-            statistics[i].idle_time,
-            statistics[i].peeking_other_time
-        );
+    if (from_idle && stop_request != 2 &&
+        new_generation == old_generation_low_32bit) {
+        // The CPU thread is waken up in the middle of the quantum
+        assert(quantum_allow_interrupt_wakeup_inside);
+        qstats_barrier_cancel();
+        return QSYNC_WOKEN_INSIDE;
     }
 
-    fclose(fp);
+    qstats_barrier_exit(finished_generation, stop_request ? QSTATS_STOP : 0);
+    quantum_vcpu_advance(cpu, new_generation, stop_request, from_idle);
+
+    if (stop_request) {
+        cpu_stop_current();
+        return QSYNC_STOPPED;
+    }
+    return QSYNC_NEXT;
 }
 
 /*
@@ -160,10 +204,6 @@ static void *mttcg_cpu_thread_fn(void *arg)
 
     qemu_mutex_lock_iothread();
     qemu_thread_get_self(cpu->thread);
-
-    // per_cpu_host_time_breakdown_t statistics[RECORD_SIZE];
-    // bzero(statistics, sizeof(per_cpu_host_time_breakdown_t) * RECORD_SIZE);
-    // uint64_t statistic_head_counter = 0;
 
     cpu->thread_id = qemu_get_thread_id();
     cpu->can_do_io = 1;
@@ -218,58 +258,26 @@ static void *mttcg_cpu_thread_fn(void *arg)
     int res = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     assert(res == 0 && "Failed to set thread affinity");
 
+    /* One host thread per vCPU: the host thread index is the cpu_index. */
+    qstats_thread_init(cpu->cpu_index, core_info_table[cpu->cpu_index].host_core_idx);
+    qstats_vcpu_attach(cpu);
+
     /* process any pending work */
     cpu->exit_request = 1;
 
-    // uint64_t dumping_threshold = 300 * 1000 * 1000; // 300M
-
-    // uint64_t ts0 = get_current_timestamp_ns();
     do {
         if (cpu_can_run(cpu)) {
             int r;
             qemu_mutex_unlock_iothread();
 continue_to_run:
+            qstats_exec_begin();
             r = tcg_cpus_exec(cpu);
+            qstats_exec_end(cpu);
             // check the quantum budget and sync before doing I/O operation.
             if (cpu->quantum_budget_depleted) {
                 cpu->quantum_budget_depleted = false;
                 while (cpu->quantum_budget_in_picosecond <= 0) {
-                    uint64_t old_generation = cpu->quantum_generation;
-                    uint32_t old_generation_low_32bit = old_generation & 0xFFFFFFFF;
-                    int stop_request = 0;
-
-                    cpu->waiting_for_quantum = 1;
-
-                    uint32_t new_generation = dynamic_barrier_polling_wait(
-                        &quantum_barrier,
-                        cpu->quantum_generation,
-                        &stop_request,
-                        cpu->touched_timer_during_last_quantum != 0
-                    );
-
-                    cpu->waiting_for_quantum = 0;
-
-                    if (stop_request != 2) {
-                        assert(new_generation == old_generation_low_32bit + 1);
-                        cpu->quantum_generation += 1;
-                        /* Budget is always one quantum of simulated time in ps. */
-                        cpu->quantum_budget_in_picosecond += (int64_t)quantum_size * 1000;
-                        cpu->touched_timer_during_last_quantum = 0;
-                        cpu->vts = cpu->quantum_generation * quantum_size;
-                    } else {
-                        // this means the vCPU quits due to the machine state change.
-                        assert(new_generation == old_generation_low_32bit);
-                        // clean the budget.
-                        cpu->quantum_budget_in_picosecond = 0;
-                        cpu->touched_timer_during_last_quantum = 1; // force updating the timer.
-                        cpu->quantum_budget_depleted = 1;
-                        cpu->quantum_generation += 1;
-                        cpu->vts = cpu->quantum_generation * quantum_size;
-                        assert(cpu->stop || cpu->stopped || !runstate_is_running());
-                    }
-
-                    if (stop_request) {
-                        cpu_stop_current();
+                    if (quantum_sync_to_next(cpu, false) != QSYNC_NEXT) {
                         break;
                     }
                 }
@@ -304,47 +312,14 @@ continue_to_run:
                     / (cpu->ip100ns ? (int64_t)cpu->ip100ns : 1);
                 // We need to sync immediately to get the quantum budget.
                 while (cpu->quantum_budget_in_picosecond <= quantum_for_deduction_ps) {
-                    uint64_t old_generation = cpu->quantum_generation;
-                    uint32_t old_generation_low_32bit = old_generation & 0xFFFFFFFF;
-                    int stop_request = 0;
-
-                    cpu->waiting_for_quantum = 1;
-
-                    uint32_t new_generation = dynamic_barrier_polling_wait(
-                        &quantum_barrier,
-                        cpu->quantum_generation,
-                        &stop_request,
-                        cpu->touched_timer_during_last_quantum != 0
-                    );
-
-                    cpu->waiting_for_quantum = 0;
-
-                    if (stop_request != 2) {
-                        assert(new_generation == old_generation_low_32bit + 1);
-                        cpu->quantum_generation += 1;
-                        /* Budget is always one quantum of simulated time in ps. */
-                        cpu->quantum_budget_in_picosecond += (int64_t)quantum_size * 1000;
-                        cpu->touched_timer_during_last_quantum = 0;
-                        cpu->vts = cpu->quantum_generation * quantum_size;
-                    } else {
-                        // this means the vCPU quits due to the machine state change.
-                        assert(new_generation == old_generation_low_32bit);
-                        // clean the budget.
-                        cpu->quantum_budget_in_picosecond = 0;
-                        cpu->touched_timer_during_last_quantum = 1; // force updating the timer.
-                        cpu->quantum_budget_depleted = 1;
-                        cpu->quantum_generation += 1;
-                        cpu->vts = cpu->quantum_generation * quantum_size;
-                        assert(cpu->stop || cpu->stopped || !runstate_is_running());
-                    }
-
-                    if (stop_request) {
-                        cpu_stop_current();
+                    if (quantum_sync_to_next(cpu, false) != QSYNC_NEXT) {
                         break;
                     }
                 }
                 assert(cpu->quantum_budget_depleted == false);
+                qstats_exec_begin();
                 cpu_exec_step_atomic(cpu);
+                qstats_exec_end(cpu);
                 qemu_mutex_lock_iothread();
             default:
                 /* Ignore everything else? */
@@ -355,61 +330,14 @@ continue_to_run:
         qatomic_set_mb(&cpu->exit_request, 0);
         qemu_wait_io_event(cpu); // This function will not decouple the thread from the barrier anymore.
         qemu_mutex_unlock_iothread();
+        // If the VM was stopped (startup, snapshot, pause), do not account the paused time.
+        qstats_resume_if_needed(cpu);
 
         // it is possible that the quantum budget is depleted due to the idle state.
         if (cpu->quantum_budget_depleted && !cpu->stopped) {
             cpu->quantum_budget_depleted = false;
             do {
-                uint64_t old_generation = cpu->quantum_generation;
-                uint32_t old_generation_low_32bit = old_generation & 0xFFFFFFFF;
-                int stop_request = 0;
-
-                cpu->sgi_sender_time_ns_valid = false;
-                cpu->waiting_for_quantum = 1;
-
-                uint32_t new_generation = dynamic_barrier_polling_wait(
-                    &quantum_barrier,
-                    cpu->quantum_generation,
-                    &stop_request,
-                    cpu->touched_timer_during_last_quantum != 0
-                );
-
-                cpu->waiting_for_quantum = 0;
-
-                if (stop_request != 2) {
-                    if (new_generation == old_generation_low_32bit) {
-                        // The CPU thread is waken up in the middle of the quantum
-                        assert(quantum_allow_interrupt_wakeup_inside);
-                        break;
-                    }
-
-                    assert(new_generation == old_generation_low_32bit + 1);
-
-                    if (cpu->quantum_budget_in_picosecond > 0) {
-                        // this means the last quantum is not completely depleted. We need to deplete it before moving forward.
-                        cpu->quantum_budget_in_picosecond = 0;
-                    }
-
-                    cpu->quantum_generation += 1;
-                    /* Budget is always one quantum of simulated time in ps. */
-                    cpu->quantum_budget_in_picosecond += (int64_t)quantum_size * 1000;
-                    cpu->touched_timer_during_last_quantum = 0;
-                    cpu->vts = cpu->quantum_generation * quantum_size;
-                } else {
-                    // this means the vCPU quits due to the machine state change.
-                    assert(new_generation == old_generation_low_32bit);
-                    // clean the budget.
-                    cpu->quantum_budget_in_picosecond = 0;
-                    cpu->touched_timer_during_last_quantum = 1; // force updating the timer.
-                    cpu->quantum_budget_depleted = 1;
-                    cpu->quantum_generation += 1;
-                    cpu->vts = cpu->quantum_generation * quantum_size;
-                    assert(cpu->stop || cpu->stopped || !runstate_is_running());
-                }
-
-
-                if (stop_request) {
-                    cpu_stop_current();
+                if (quantum_sync_to_next(cpu, true) != QSYNC_NEXT) {
                     break;
                 }
             } while (cpu->quantum_budget_in_picosecond <= 0);
@@ -425,15 +353,6 @@ continue_to_run:
 
     // resign the current thread from the barrier.
     dynamic_barrier_polling_decrease_by_1(&quantum_barrier);
-
-    // also, print the histogram.
-    // open a log file.
-    char log_name[100];
-    snprintf(log_name, 100, "quantum_histogram_%d.log", cpu->cpu_index);
-
-    FILE *fp = fopen(log_name, "w");
-    print_histogram(quantum_barrier.histogram[cpu->cpu_index], fp);
-    fclose(fp);
 
     return NULL;
 }
@@ -464,4 +383,5 @@ void quantum_start_vcpu_thread(CPUState *cpu)
 
 void quantum_initialize_barrier(void) {
     dynamic_barrier_polling_init(&quantum_barrier, 0);
+    qstats_global_init();
 }
