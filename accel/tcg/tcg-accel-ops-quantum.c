@@ -273,6 +273,9 @@ continue_to_run:
             qstats_exec_begin();
             r = tcg_cpus_exec(cpu);
             qstats_exec_end(cpu);
+            if (r == EXCP_YIELD) {
+                cpu->qstats_yield_exits++; // WFE/YIELD: the guest is spin-waiting
+            }
             // check the quantum budget and sync before doing I/O operation.
             if (cpu->quantum_budget_depleted) {
                 cpu->quantum_budget_depleted = false;

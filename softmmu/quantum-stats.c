@@ -3,6 +3,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <sys/resource.h>
 #include "qemu/atomic.h"
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
@@ -15,6 +16,14 @@
 #define QSTATS_BUF_RECORDS 65536
 /* Room kept in the vCPU buffer for the records of one quantum (all co-located vCPUs). */
 #define QSTATS_VCPU_SLACK  256
+
+#define QSTATS_HOST_HEADER \
+    "generation,t_start_ns,exec_ns,barrier_ns,ctx_switch_ns,bql_wait_ns," \
+    "exec_cpu_ns,barrier_cpu_ns,n_switches,flags," \
+    "release_ns,barrier_bql_ns,vol_csw,invol_csw"
+#define QSTATS_VCPU_HEADER \
+    "generation,cpu_idx,insns,host_exec_ns,bql_wait_ns,wfi_ps,idle_entries," \
+    "busy_ps,bql_wait_exec_ns,bql_acq,yield_exits"
 
 __thread QStatsHost *qstats_self;
 
@@ -54,18 +63,22 @@ static void qs_write_buffers(QStatsHost *s)
     for (size_t i = 0; i < hlen; i++) {
         const QStatsHostRec *r = &s->hbuf[i];
         fprintf(s->hfp, "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 "\n",
+                ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32
+                ",%" PRIu64 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 "\n",
                 r->generation, r->t_start_ns, r->exec_ns, r->barrier_ns,
                 r->ctx_switch_ns, r->bql_wait_ns, r->exec_cpu_ns, r->barrier_cpu_ns,
-                r->n_switches, r->flags);
+                r->n_switches, r->flags,
+                r->release_ns, r->barrier_bql_ns, r->vol_csw, r->invol_csw);
     }
 
     for (size_t i = 0; i < vlen; i++) {
         const QStatsVcpuRec *r = &s->vbuf[i];
         fprintf(s->vfp, "%" PRIu64 ",%" PRIu32 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                ",%" PRId64 ",%" PRIu32 "\n",
+                ",%" PRId64 ",%" PRIu32
+                ",%" PRIu64 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 "\n",
                 r->generation, r->cpu_idx, r->insns, r->host_exec_ns, r->bql_wait_ns,
-                r->wfi_ps, r->idle_entries);
+                r->wfi_ps, r->idle_entries,
+                r->busy_ps, r->bql_wait_exec_ns, r->bql_acq, r->yield_exits);
     }
 }
 
@@ -88,6 +101,25 @@ static void qs_flush(QStatsHost *s)
     g_mutex_unlock(&qs_lock);
 
     s->pending_flags |= QSTATS_FLUSHED;
+}
+
+/* OS context switches of the calling thread so far (one syscall). */
+static void qs_read_csw(long *nvcsw, long *nivcsw)
+{
+    struct rusage ru;
+
+    if (getrusage(RUSAGE_THREAD, &ru) == 0) {
+        *nvcsw = ru.ru_nvcsw;
+        *nivcsw = ru.ru_nivcsw;
+    } else {
+        *nvcsw = *nivcsw = 0;
+    }
+}
+
+/* Starts counting the context switches of a new quantum from now. */
+static void qs_csw_baseline(QStatsHost *s)
+{
+    qs_read_csw(&s->nvcsw_prev, &s->nivcsw_prev);
 }
 
 /* Reads scheduler statistics of a thread from /proc (Linux only). */
@@ -150,7 +182,8 @@ static void qs_write_metadata(uint64_t t_exit)
     g_free(path);
     if (fp) {
         fprintf(fp, "quantum_size_ns=%" PRIu64 "\n", quantum_size);
-        fprintf(fp, "wall_ns=%" PRIu64 "\n", t_exit - qs_t_init);
+        /* From qstats_global_init() (accelerator init, before -loadvm) to exit. */
+        fprintf(fp, "process_wall_ns=%" PRIu64 "\n", t_exit - qs_t_init);
         fprintf(fp, "host_threads=%d\n", qs_nthreads);
         fclose(fp);
     }
@@ -185,17 +218,29 @@ static void qs_exit(Notifier *n, void *data)
 }
 
 /*
- * BQL waits of vCPU threads (installed in qstats_bql_wait_cb). Waits inside
- * the barrier (the last arriver takes the BQL there) belong to barrier_ns.
+ * BQL waits of vCPU threads (installed in qstats_bql_wait_cb).
+ * - Inside the barrier (only the last arriver takes the BQL there): part of
+ *   barrier_ns, reported separately as barrier_bql_ns.
+ * - Elsewhere: bql_wait_ns of the thread and of the vCPU; the part spent
+ *   inside TCG is also reported as bql_wait_exec_ns and removed from
+ *   host_exec_ns.
  */
 static void qs_bql_wait(CPUState *cpu, uint64_t wait_ns)
 {
     QStatsHost *s = qstats_self;
-    if (!s || s->in_barrier) {
+    if (!s) {
+        return;
+    }
+    if (s->in_barrier) {
+        s->barrier_bql_acc += wait_ns;
         return;
     }
     s->bql_acc += wait_ns;
     cpu->qstats_bql_wait_ns += wait_ns;
+    cpu->qstats_bql_acq++;
+    if (s->in_exec) {
+        cpu->qstats_bql_wait_exec_ns += wait_ns;
+    }
 }
 
 void qstats_global_init(void)
@@ -228,16 +273,13 @@ void qstats_thread_init(int host_tid, int host_core)
     s->kernel_tid = qemu_get_thread_id();
     s->hbuf = g_new(QStatsHostRec, QSTATS_BUF_RECORDS);
     s->vbuf = g_new(QStatsVcpuRec, QSTATS_BUF_RECORDS);
-    s->hfp = qs_open("host", host_tid,
-                     "generation,t_start_ns,exec_ns,barrier_ns,ctx_switch_ns,"
-                     "bql_wait_ns,exec_cpu_ns,barrier_cpu_ns,n_switches,flags");
-    s->vfp = qs_open("vcpu", host_tid,
-                     "generation,cpu_idx,insns,host_exec_ns,bql_wait_ns,wfi_ps,"
-                     "idle_entries");
+    s->hfp = qs_open("host", host_tid, QSTATS_HOST_HEADER);
+    s->vfp = qs_open("vcpu", host_tid, QSTATS_VCPU_HEADER);
     /* The thread starts with the VM stopped: time starts at the first resume. */
     s->need_restart = true;
     s->t_start = qstats_now_ns();
     s->cpu_start = qstats_thread_cpu_ns();
+    qs_csw_baseline(s);
 
     g_mutex_lock(&qs_lock);
     assert(qs_nthreads < QSTATS_MAX_THREADS);
@@ -266,8 +308,11 @@ void qstats_resume_if_needed(CPUState *cpu)
     s->need_restart = false;
     s->t_start = qstats_now_ns();
     s->cpu_start = qstats_thread_cpu_ns();
+    qs_csw_baseline(s);
     s->ctx_acc = 0;
     s->bql_acc = 0;
+    s->barrier_bql_acc = 0;
+    s->release_ns = 0;
     s->n_switches = 0;
     s->in_barrier = false;
     s->pending_flags |= QSTATS_RESUMED;
@@ -282,6 +327,9 @@ void qstats_barrier_exit(uint64_t generation, uint32_t flags)
 
     uint64_t t = qstats_now_ns();
     uint64_t cpu_t = qstats_thread_cpu_ns();
+    long nvcsw, nivcsw;
+    qs_read_csw(&nvcsw, &nivcsw);
+
     uint64_t span = s->t_bar_enter - s->t_start;
     uint64_t other = s->ctx_acc + s->bql_acc;
     size_t n = s->hlen;
@@ -301,19 +349,28 @@ void qstats_barrier_exit(uint64_t generation, uint32_t flags)
     r->barrier_cpu_ns = cpu_t - s->cpu_bar_enter;
     r->n_switches = s->n_switches;
     r->flags = s->pending_flags | flags;
+    r->release_ns = (r->flags & QSTATS_LAST_ARRIVER) ? s->release_ns : 0;
+    r->barrier_bql_ns = s->barrier_bql_acc;
+    r->vol_csw = (uint32_t)(nvcsw - s->nvcsw_prev);
+    r->invol_csw = (uint32_t)(nivcsw - s->nivcsw_prev);
     /* Publish only the complete record. */
     qatomic_store_release(&s->hlen, n + 1);
 
     s->in_barrier = false;
     s->ctx_acc = 0;
     s->bql_acc = 0;
+    s->barrier_bql_acc = 0;
+    s->release_ns = 0;
     s->n_switches = 0;
     s->pending_flags = 0;
+    s->nvcsw_prev = nvcsw;
+    s->nivcsw_prev = nivcsw;
 
-    if (flags & QSTATS_STOP) {
-        /* The thread is about to be stopped: restart timing on resume. */
-        s->need_restart = true;
-    }
+    /*
+     * On a stop request nothing else is needed here: the thread then blocks
+     * in qemu_wait_io_event() with cpu->qstats_paused set, and
+     * qstats_resume_if_needed() restarts the timing when the VM resumes.
+     */
 
     if (n + 1 == QSTATS_BUF_RECORDS ||
         s->vlen + QSTATS_VCPU_SLACK > QSTATS_BUF_RECORDS) {
@@ -321,6 +378,7 @@ void qstats_barrier_exit(uint64_t generation, uint32_t flags)
         /* The flush is not accounted to the next quantum (it is flagged FLUSHED). */
         t = qstats_now_ns();
         cpu_t = qstats_thread_cpu_ns();
+        qs_csw_baseline(s);
     }
 
     s->t_start = t;
@@ -329,8 +387,10 @@ void qstats_barrier_exit(uint64_t generation, uint32_t flags)
 
 void qstats_exec_end(CPUState *cpu)
 {
-    if (qstats_self) {
-        cpu->qstats_host_exec_ns += qstats_now_ns() - qstats_self->t_exec_start;
+    QStatsHost *s = qstats_self;
+    if (s) {
+        cpu->qstats_host_exec_ns += qstats_now_ns() - s->t_exec_start;
+        s->in_exec = false;
     }
 }
 
@@ -348,16 +408,26 @@ void qstats_vcpu_end_quantum(CPUState *cpu, uint64_t generation)
         r->generation = generation;
         r->cpu_idx = cpu->cpu_index;
         r->insns = cpu->qstats_insns;
-        r->host_exec_ns = cpu->qstats_host_exec_ns;
+        /* Net of the BQL waits inside TCG, which are in bql_wait_ns. */
+        r->host_exec_ns = cpu->qstats_host_exec_ns > cpu->qstats_bql_wait_exec_ns
+                          ? cpu->qstats_host_exec_ns - cpu->qstats_bql_wait_exec_ns : 0;
         r->bql_wait_ns = cpu->qstats_bql_wait_ns;
         r->wfi_ps = cpu->qstats_wfi_ps;
         r->idle_entries = cpu->qstats_idle_entries;
+        r->busy_ps = cpu->qstats_busy_ps;
+        r->bql_wait_exec_ns = cpu->qstats_bql_wait_exec_ns;
+        r->bql_acq = cpu->qstats_bql_acq;
+        r->yield_exits = cpu->qstats_yield_exits;
         qatomic_store_release(&s->vlen, n + 1);
     }
 
     cpu->qstats_insns = 0;
+    cpu->qstats_busy_ps = 0;
     cpu->qstats_host_exec_ns = 0;
     cpu->qstats_bql_wait_ns = 0;
+    cpu->qstats_bql_wait_exec_ns = 0;
+    cpu->qstats_bql_acq = 0;
+    cpu->qstats_yield_exits = 0;
     cpu->qstats_wfi_ps = 0;
     cpu->qstats_idle_entries = 0;
 }

@@ -189,7 +189,7 @@ uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32
     uint64_t waiting_count = barrier->count;
 
     if (waiting_count == barrier->threshold - 1) {
-        qstats_note_last_arriver();
+        qstats_release_begin();
         barrier->current_cycle += quantum_size;
         bool broadcast_stop_request = 0;
         barrier->count = 0;
@@ -246,6 +246,8 @@ uint32_t dynamic_barrier_polling_wait(dynamic_barrier_polling_t *barrier, uint32
 
         // cancel the sgi waking up request, because the thread is going to wake up.
         current_cpu->sgi_sender_time_ns_valid = false;
+
+        qstats_release_end();
 
         // increase the generation and notify others.
         atomic_store(&barrier->return_value.one_64, *((uint64_t *)&return_value));

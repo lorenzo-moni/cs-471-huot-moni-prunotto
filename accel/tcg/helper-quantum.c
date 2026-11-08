@@ -68,8 +68,9 @@ void quantum_flush_current_stats(CPUState *cpu)
                                * 100000 / cpu->ip100ns;
     }
 
-    /* Per-quantum instruction count for the qstats breakdown. */
+    /* Per-quantum instruction count and simulated time for the qstats breakdown. */
     cpu->qstats_insns += cpu->last_tb_instruction_count_for_quantum;
+    cpu->qstats_busy_ps += required_picoseconds;
     cpu->last_tb_instruction_count_for_quantum = 0;
 
     /* Convert picoseconds to nanoseconds for target_cycle tracking. */

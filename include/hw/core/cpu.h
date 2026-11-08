@@ -500,10 +500,14 @@ struct CPUState {
      * include/sysemu/quantum-stats.h). Accumulated during the quantum and
      * reset by qstats_vcpu_end_quantum().
      */
-    uint64_t qstats_insns;        // guest instructions executed in this quantum
+    uint64_t qstats_insns;        // guest instructions executed in this quantum (whole TBs)
+    uint64_t qstats_busy_ps;      // simulated time deducted from the budget by execution (ps)
     int64_t  qstats_wfi_ps;       // simulated time given up in WFI/idle (ps)
-    uint64_t qstats_host_exec_ns; // host time spent in tcg_cpus_exec() for this vCPU
-    uint64_t qstats_bql_wait_ns;  // host time its thread waited for the BQL
+    uint64_t qstats_host_exec_ns; // host time in tcg_cpus_exec()/cpu_exec_step_atomic(), BQL waits included
+    uint64_t qstats_bql_wait_ns;  // host time its thread waited for the BQL (outside the barrier)
+    uint64_t qstats_bql_wait_exec_ns; // part of qstats_bql_wait_ns spent inside TCG
+    uint32_t qstats_bql_acq;      // BQL acquisitions by its thread (outside the barrier)
+    uint32_t qstats_yield_exits;  // exits from TCG with EXCP_YIELD (WFE/YIELD)
     uint32_t qstats_idle_entries; // number of times the vCPU went idle
     bool     qstats_bql_on;       // time the BQL waits of this vCPU (set by qstats_vcpu_attach)
     bool     qstats_paused;       // its thread blocked in qemu_wait_io_event() because it was stopped
