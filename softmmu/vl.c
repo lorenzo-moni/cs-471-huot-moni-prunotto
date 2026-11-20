@@ -489,6 +489,11 @@ static QemuOptsList qemu_quantum_opts = {
             .name = "rr",
             .type = QEMU_OPT_BOOL,
         },
+        {
+            /* Directory for the per-quantum host-time breakdown (qstats). */
+            .name = "stats",
+            .type = QEMU_OPT_STRING,
+        },
         {} /* end of list */
     },
 };

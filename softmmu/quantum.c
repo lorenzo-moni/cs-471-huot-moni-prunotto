@@ -2,11 +2,13 @@
 #include "sysemu/quantum.h"
 #include "sysemu/asid-coeff.h"
 #include "qemu/option.h"
+#include "qemu/error-report.h"
 
 uint64_t quantum_size = 0;
 uint64_t quantum_check_threshold = 0;
 bool quantum_allow_interrupt_wakeup_inside = 0; // allow interrupts and other `run_on_cpu` to wake up a thread that spins on the quantum barrier.
 bool quantum_rr_mode = false; // Enable quantum-rr mode (single-threaded with quantum)
+char *quantum_stats_dir = NULL; // Output directory of the per-quantum breakdown; NULL disables it.
 static uint64_t quantum_enabled_lower_bound = 0;
 static uint64_t quantum_enabled_upper_bound = 0;
 
@@ -38,6 +40,16 @@ void quantum_configure(QemuOpts *opts, Error **errp) {
 
     quantum_allow_interrupt_wakeup_inside = qemu_opt_get_bool(opts, "allow_interrupt_wakeup_inside", false);
     quantum_rr_mode = qemu_opt_get_bool(opts, "rr", false);
+
+    const char *stats_dir = qemu_opt_get(opts, "stats");
+    if (stats_dir && stats_dir[0] != '\0') {
+        if (quantum_rr_mode) {
+            /* The single-threaded quantum-rr loop is not instrumented. */
+            warn_report("quantum: stats=%s is ignored with rr=on", stats_dir);
+        } else {
+            quantum_stats_dir = g_strdup(stats_dir);
+        }
+    }
 
     // make it as a global value.
     quantum_size = quantum_size_tmp;
