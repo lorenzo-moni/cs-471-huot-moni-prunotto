@@ -30,6 +30,7 @@
 #include "sysemu/replay.h"
 #include "sysemu/cpu-timers.h"
 #include "sysemu/quantum.h"
+#include "sysemu/quantum-stats.h"
 #include "sysemu/asid-coeff.h"
 #include "qemu/main-loop.h"
 #include "qemu/guest-random.h"
@@ -88,6 +89,11 @@ void tcg_handle_interrupt(CPUState *cpu, int mask)
     g_assert(qemu_mutex_iothread_locked());
 
     cpu->interrupt_request |= mask;
+
+    /* qstats: count interrupts to a vCPU that stays idle until the next quantum. */
+    if (unlikely(qstats_late_wake_on)) {
+        qstats_note_interrupt(cpu);
+    }
 
     /*
      * If called from iothread context, wake the target cpu in

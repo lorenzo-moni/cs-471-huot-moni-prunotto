@@ -477,6 +477,19 @@ struct CPUState {
     uint64_t last_tb_instruction_count_for_quantum;
     int quantum_budget_depleted;
 
+    /*
+     * Time multiplexing (several vCPUs per host thread, see
+     * accel/tcg/tcg-accel-ops-quantum.c). The current time slice ends when
+     * the budget falls to quantum_slice_floor_ps (0 when the slice is the
+     * whole quantum). quantum_done: the vCPU has finished its quantum (budget
+     * used, idle or stopped) and waits for its host thread to cross the
+     * barrier. quantum_done_idle: it finished because it was idle (WFI), so
+     * its unused budget is dropped when the next quantum starts.
+     */
+    int64_t quantum_slice_floor_ps;
+    bool quantum_done;
+    bool quantum_done_idle;
+
     uint64_t touched_timer_during_last_quantum; // whether this core has touched the timer during the last quantum.
 
     // State to query the latest timer interrupt deadline.
@@ -510,7 +523,10 @@ struct CPUState {
     uint32_t qstats_yield_exits;  // exits from TCG with EXCP_YIELD (WFE/YIELD)
     uint32_t qstats_idle_entries; // number of times the vCPU went idle
     bool     qstats_bql_on;       // time the BQL waits of this vCPU (set by qstats_vcpu_attach)
-    bool     qstats_paused;       // its thread blocked in qemu_wait_io_event() because it was stopped
+    int      qstats_host_tid;     // qstats index of its host thread (set by qstats_vcpu_attach)
+    uint32_t qstats_late_wake[3]; // interrupts received while idle until the next quantum, by
+                                  // sender: QSTATS_WAKE_SIBLING / _REMOTE / _OTHER (atomic)
+    bool     qstats_paused;       // its host thread blocked because the vCPU was stopped (VM paused)
 };
 
 typedef QTAILQ_HEAD(CPUTailQ, CPUState) CPUTailQ;

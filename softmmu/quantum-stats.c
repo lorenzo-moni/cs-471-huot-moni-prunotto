@@ -23,9 +23,11 @@
     "release_ns,barrier_bql_ns,vol_csw,invol_csw"
 #define QSTATS_VCPU_HEADER \
     "generation,cpu_idx,insns,host_exec_ns,bql_wait_ns,wfi_ps,idle_entries," \
-    "busy_ps,bql_wait_exec_ns,bql_acq,yield_exits"
+    "busy_ps,bql_wait_exec_ns,bql_acq,yield_exits," \
+    "late_wake_sibling,late_wake_remote,late_wake_other"
 
 __thread QStatsHost *qstats_self;
+bool qstats_late_wake_on;
 
 /*
  * qs_lock protects the thread registry, qs_closed, the files and the
@@ -75,10 +77,12 @@ static void qs_write_buffers(QStatsHost *s)
         const QStatsVcpuRec *r = &s->vbuf[i];
         fprintf(s->vfp, "%" PRIu64 ",%" PRIu32 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
                 ",%" PRId64 ",%" PRIu32
-                ",%" PRIu64 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32 "\n",
+                ",%" PRIu64 ",%" PRIu64 ",%" PRIu32 ",%" PRIu32
+                ",%" PRIu32 ",%" PRIu32 ",%" PRIu32 "\n",
                 r->generation, r->cpu_idx, r->insns, r->host_exec_ns, r->bql_wait_ns,
                 r->wfi_ps, r->idle_entries,
-                r->busy_ps, r->bql_wait_exec_ns, r->bql_acq, r->yield_exits);
+                r->busy_ps, r->bql_wait_exec_ns, r->bql_acq, r->yield_exits,
+                r->late_wake_sibling, r->late_wake_remote, r->late_wake_other);
     }
 }
 
@@ -164,15 +168,20 @@ static void qs_write_metadata(uint64_t t_exit)
     if (fp) {
         fprintf(fp, "tid,host_core,kernel_tid,n_flushes,flush_ns,sched_run_ns,"
                     "sched_wait_ns,sched_timeslices,voluntary_ctxt_switches,"
-                    "nonvoluntary_ctxt_switches\n");
+                    "nonvoluntary_ctxt_switches,vcpus\n");
         for (int i = 0; i < qs_nthreads; i++) {
             QStatsHost *s = qs_threads[i];
             uint64_t run_ns, wait_ns, slices, vol, nonvol;
             qs_read_sched(s->kernel_tid, &run_ns, &wait_ns, &slices, &vol, &nonvol);
             fprintf(fp, "%d,%d,%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                    ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+                    ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",",
                     s->tid, s->host_core, s->kernel_tid, s->n_flushes, s->flush_ns,
                     run_ns, wait_ns, slices, vol, nonvol);
+            /* vCPUs run by the thread, e.g. 0+4 */
+            for (int v = 0; v < s->n_vcpus; v++) {
+                fprintf(fp, "%s%d", v ? "+" : "", s->vcpu_idx[v]);
+            }
+            fprintf(fp, "\n");
         }
         fclose(fp);
     }
@@ -185,6 +194,13 @@ static void qs_write_metadata(uint64_t t_exit)
         /* From qstats_global_init() (accelerator init, before -loadvm) to exit. */
         fprintf(fp, "process_wall_ns=%" PRIu64 "\n", t_exit - qs_t_init);
         fprintf(fp, "host_threads=%d\n", qs_nthreads);
+        int n_vcpus = 0;
+        for (int i = 0; i < qs_nthreads; i++) {
+            n_vcpus += qs_threads[i]->n_vcpus;
+        }
+        fprintf(fp, "vcpus=%d\n", n_vcpus);
+        /* Simulated time a vCPU runs per turn; one slice per quantum for now. */
+        fprintf(fp, "slice_ns=%" PRIu64 "\n", quantum_size);
         fclose(fp);
     }
 }
@@ -236,6 +252,10 @@ static void qs_bql_wait(CPUState *cpu, uint64_t wait_ns)
         return;
     }
     s->bql_acc += wait_ns;
+    if (s->in_ctx) {
+        /* Not part of ctx_switch_ns: it is already in bql_wait_ns. */
+        s->ctx_bql_acc += wait_ns;
+    }
     cpu->qstats_bql_wait_ns += wait_ns;
     cpu->qstats_bql_acq++;
     if (s->in_exec) {
@@ -257,6 +277,7 @@ void qstats_global_init(void)
     qs_exit_notifier.notify = qs_exit;
     qemu_add_exit_notifier(&qs_exit_notifier);
     qstats_bql_wait_cb = qs_bql_wait;
+    qstats_late_wake_on = true;
     qs_global_ready = true;
 }
 
@@ -289,11 +310,46 @@ void qstats_thread_init(int host_tid, int host_core)
     qstats_self = s;
 }
 
+/* Idempotent: a host thread may attach its members more than once. */
 void qstats_vcpu_attach(CPUState *cpu)
 {
-    if (qstats_self) {
-        cpu->qstats_bql_on = true;
+    QStatsHost *s = qstats_self;
+
+    if (!s || cpu->qstats_bql_on) {
+        return;
     }
+    cpu->qstats_bql_on = true;
+    cpu->qstats_host_tid = s->tid;
+    if (s->n_vcpus < QSTATS_MAX_THREAD_VCPUS) {
+        s->vcpu_idx[s->n_vcpus++] = cpu->cpu_index;
+    }
+}
+
+/*
+ * Called by tcg_handle_interrupt() with the BQL held, in the sender's thread,
+ * after the interrupt has been raised on @target. Counts it if it would wake
+ * @target while @target is idle until the next quantum (so it is taken only
+ * at the next quantum), by sender: a vCPU of the same host thread, of another
+ * host thread, or no vCPU at all. Timer interrupts raised by first_cpu, the
+ * timekeeper, are counted as coming from first_cpu. Has no effect on the
+ * simulation.
+ */
+void qstats_note_interrupt(CPUState *target)
+{
+    QStatsHost *s = qstats_self;
+    int sender;
+
+    if (!qatomic_read(&target->quantum_done_idle) || !cpu_has_work(target)) {
+        return;
+    }
+    if (!s || !current_cpu) {
+        sender = QSTATS_WAKE_OTHER;
+    } else if (s->tid == target->qstats_host_tid) {
+        sender = QSTATS_WAKE_SIBLING;
+    } else {
+        sender = QSTATS_WAKE_REMOTE;
+    }
+    qatomic_inc(&target->qstats_late_wake[sender]);
 }
 
 void qstats_resume_if_needed(CPUState *cpu)
@@ -310,11 +366,13 @@ void qstats_resume_if_needed(CPUState *cpu)
     s->cpu_start = qstats_thread_cpu_ns();
     qs_csw_baseline(s);
     s->ctx_acc = 0;
+    s->ctx_bql_acc = 0;
     s->bql_acc = 0;
     s->barrier_bql_acc = 0;
     s->release_ns = 0;
     s->n_switches = 0;
     s->in_barrier = false;
+    s->in_ctx = false;
     s->pending_flags |= QSTATS_RESUMED;
 }
 
@@ -418,6 +476,10 @@ void qstats_vcpu_end_quantum(CPUState *cpu, uint64_t generation)
         r->bql_wait_exec_ns = cpu->qstats_bql_wait_exec_ns;
         r->bql_acq = cpu->qstats_bql_acq;
         r->yield_exits = cpu->qstats_yield_exits;
+        /* Written by other threads: take and reset them atomically. */
+        r->late_wake_sibling = qatomic_xchg(&cpu->qstats_late_wake[QSTATS_WAKE_SIBLING], 0);
+        r->late_wake_remote = qatomic_xchg(&cpu->qstats_late_wake[QSTATS_WAKE_REMOTE], 0);
+        r->late_wake_other = qatomic_xchg(&cpu->qstats_late_wake[QSTATS_WAKE_OTHER], 0);
         qatomic_store_release(&s->vlen, n + 1);
     }
 

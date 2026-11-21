@@ -441,55 +441,17 @@ void qemu_wait_io_event(CPUState *cpu)
 {
     bool slept = false;
 
+    /*
+     * The quantum mode does not use this function: its host threads poll
+     * their vCPUs without blocking and account the idle (WFI) time
+     * themselves (quantum_poll_vcpu() in accel/tcg/tcg-accel-ops-quantum.c).
+     */
     while (cpu_thread_is_idle(cpu)) {
         if (!slept) {
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
         }
-        // if (!not_running_yet && is_vcpu_affiliated_with_quantum(cpu->cpu_index)) {
-        //     // Before going to sleep, you should let the quantum barrier know that I will not be involved.
-        //     cpu->unknown_time = 1;
-        //     assert(dynamic_barrier_polling_decrease_by_1(&quantum_barrier) == 0);
-        // }
-
-        // uint64_t current_cpu_clock = cpu_get_clock_locked();
-
-        // I need to calculate the number of host miliseconds that I have been sleeping.
-
-        if (cpu->stopped) {
-            // The CPU has been stopped by the system (e.g., via pause_all_vcpus).
-            // Wait until we're resumed.
-            qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
-            cpu->qstats_paused = true; // qstats: do not account the paused time to a quantum.
-            cpu->quantum_budget_in_picosecond = 0; // force entering the barrier.
-            cpu->quantum_budget_depleted = 1;
-        } else if (!cpu->stop) {
-            // CPU is running normally (not being asked to stop).
-            bool affiliated_with_quantum = cpu->ip100ns != 0 && quantum_enabled();
-            if (affiliated_with_quantum) {
-                // record the idle time.
-                record_statistics_to_plugin(cpu->cpu_index, 4, cpu->quantum_budget_in_picosecond / 1000);
-                /* qstats: the unused budget is the simulated time spent in WFI. */
-                if (cpu->quantum_budget_in_picosecond > 0) {
-                    cpu->qstats_wfi_ps += cpu->quantum_budget_in_picosecond;
-                }
-                cpu->qstats_idle_entries++;
-                /*
-                 * first_cpu is the timekeeper: bank the unused (idle) portion
-                 * of its budget into the virtual clock so time keeps advancing
-                 * while first_cpu is halted, and run any timer now due.  The
-                 * BQL is held here, so quantum_run_due_timers() won't relock.
-                 */
-                if (cpu == first_cpu && cpu->quantum_budget_in_picosecond > 0) {
-                    advance_quantum_time_ps(cpu->quantum_budget_in_picosecond);
-                    quantum_run_due_timers();
-                }
-                cpu->quantum_budget_depleted = 1;
-                break; // we need to break in order to wait for the barrier.
-            } else {
-                qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
-            }
-        }
+        qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
     }
     if (slept) {
         qemu_plugin_vcpu_resume_cb(cpu);

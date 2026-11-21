@@ -39,6 +39,10 @@ void quantum_configure(QemuOpts *opts, Error **errp) {
     }
 
     quantum_allow_interrupt_wakeup_inside = qemu_opt_get_bool(opts, "allow_interrupt_wakeup_inside", false);
+    if (quantum_allow_interrupt_wakeup_inside) {
+        /* The barrier always ends the quantum: an idle vCPU wakes at the next one. */
+        warn_report("quantum: allow_interrupt_wakeup_inside has no effect");
+    }
     quantum_rr_mode = qemu_opt_get_bool(opts, "rr", false);
 
     const char *stats_dir = qemu_opt_get(opts, "stats");
