@@ -4589,11 +4589,20 @@ SRST
 ERST
 
 DEF("quantum", HAS_ARG, QEMU_OPTION_quantum, \
-    "-quantum size=N[,range=0-N] \n" \
-    "               Enable quantum to confine the relative speed of each core. \n" \
-    "               When the quantum size is specified, all cores synchronize with a barrier when they execute N instructions. \n" \
-    "               0 or no option means the quantum is not enabled. \n" \
-    "               The range parameter specify which range of cores are enabled for quantum. By default, all cores are enabled.", QEMU_ARCH_ARM
+    "-quantum size=N[,slice=S][,check_period=P][,ipns_file=F][,stats=DIR][,rr=on|off]\n" \
+    "               Enable quantum to confine the relative speed of each core:\n" \
+    "               every vCPU executes N ns of simulated time per quantum, then all host\n" \
+    "               threads synchronize at a barrier. 0 or no option disables it.\n" \
+    "               ipns_file=F: core_info file (default core_info.csv). vCPUs whose rows\n" \
+    "               have the same host_core_idx share one host thread pinned to that core\n" \
+    "               (N:M time multiplexing); otherwise each vCPU has its own thread.\n" \
+    "               slice=S: with several vCPUs per host thread, run each of them S ns per\n" \
+    "               turn, ceil(N/S) rounds per quantum (S <= N, at most 64 rounds; default\n" \
+    "               S = N, one turn per quantum).\n" \
+    "               check_period=P: run the periodic plugin check every P ns (a multiple of N).\n" \
+    "               stats=DIR: write the per-quantum host-time breakdown (qstats) to DIR.\n" \
+    "               rr=on: run all vCPUs round-robin on one host thread (sequential warming;\n" \
+    "               slice and stats are ignored).", QEMU_ARCH_ARM
 )
 
 DEF("watchdog-action", HAS_ARG, QEMU_OPTION_watchdog_action, \

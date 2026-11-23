@@ -199,8 +199,8 @@ static void qs_write_metadata(uint64_t t_exit)
             n_vcpus += qs_threads[i]->n_vcpus;
         }
         fprintf(fp, "vcpus=%d\n", n_vcpus);
-        /* Simulated time a vCPU runs per turn; one slice per quantum for now. */
-        fprintf(fp, "slice_ns=%" PRIu64 "\n", quantum_size);
+        /* Simulated time a vCPU runs per turn (-quantum slice=, default size). */
+        fprintf(fp, "slice_ns=%" PRIu64 "\n", quantum_slice_size);
         fclose(fp);
     }
 }

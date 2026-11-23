@@ -224,6 +224,20 @@ static QuantumHostThread *quantum_attach_vcpu(CPUState *cpu)
  * Per-vCPU quantum state, set before the VM runs: by the host thread for the
  * member that created it, by quantum_start_vcpu_thread() for the others.
  */
+
+/*
+ * Slice floor at the start of a quantum that begins with @budget_ps: the
+ * first slice ends when the budget has fallen by one slice. The floor is 0
+ * when the slice is the whole quantum (one turn per quantum).
+ */
+static int64_t quantum_first_slice_floor(int64_t budget_ps)
+{
+    if (quantum_slice_size >= quantum_size) {
+        return 0;
+    }
+    return MAX(0, budget_ps - (int64_t)quantum_slice_size * 1000);
+}
+
 static void quantum_vcpu_init(CPUState *cpu, uint64_t generation)
 {
     // Copy core info from table to CPUState
@@ -262,7 +276,7 @@ static void quantum_vcpu_init(CPUState *cpu, uint64_t generation)
     assert(cpu->quantum_budget_in_picosecond > 0);
     cpu->last_tb_instruction_count_for_quantum = 0;
     cpu->quantum_budget_depleted = 0;
-    cpu->quantum_slice_floor_ps = 0;
+    cpu->quantum_slice_floor_ps = quantum_first_slice_floor(cpu->quantum_budget_in_picosecond);
     cpu->quantum_done = false;
     cpu->quantum_done_idle = false;
 
@@ -326,8 +340,8 @@ static void quantum_vcpu_advance(CPUState *cpu, uint32_t new_generation,
     cpu->touched_timer_during_last_quantum = 0;
     cpu->vts = cpu->quantum_generation * quantum_size;
 
-    /* One slice per quantum: the slice ends when the budget is used. */
-    cpu->quantum_slice_floor_ps = 0;
+    /* The first slice of the new quantum (the whole quantum if slice == size). */
+    cpu->quantum_slice_floor_ps = quantum_first_slice_floor(cpu->quantum_budget_in_picosecond);
     cpu->quantum_done = false;
     qatomic_set(&cpu->quantum_done_idle, false);
     cpu->waiting_for_quantum = 0;
@@ -479,6 +493,7 @@ static void quantum_prologue(QuantumHostThread *t)
          */
         cpu->qstats_paused = true; // qstats: do not account the paused time to a quantum.
         cpu->quantum_budget_in_picosecond = 0; // force entering the barrier.
+        cpu->quantum_slice_floor_ps = 0;
     }
 
     if (quantum_all_stopped(t, false)) {
@@ -634,13 +649,16 @@ static void quantum_dispatch(QuantumHostThread *t, CPUState *cpu)
 }
 
 /*
- * Runs the members in rounds until each of them is done for the quantum.
- * With one slice per quantum (slice floor 0) a dispatch only returns when the
- * vCPU is done, so there is a single round.
+ * Runs the members in rounds, in ascending cpu_index order, until each of
+ * them is done for the quantum. A dispatch returns at the end of the vCPU's
+ * slice; after each round the slice floor of every vCPU not done yet drops by
+ * one slice, down to 0, where the dispatch only returns once the vCPU is done.
+ * So a quantum takes at most ceil(budget / slice) rounds, a single one when
+ * the slice is the whole quantum.
  */
 static void quantum_run_rounds(QuantumHostThread *t)
 {
-    const int64_t slice_ps = (int64_t)quantum_size * 1000;
+    const int64_t slice_ps = (int64_t)quantum_slice_size * 1000;
 
     for (;;) {
         bool all_done = true;

@@ -478,6 +478,11 @@ static QemuOptsList qemu_quantum_opts = {
             .type = QEMU_OPT_NUMBER,
         },
         {
+            /* Time slice (ns) of the N:M scheduler; defaults to size. */
+            .name = "slice",
+            .type = QEMU_OPT_NUMBER,
+        },
+        {
             .name = "allow_interrupt_wakeup_inside",
             .type = QEMU_OPT_BOOL,
         },

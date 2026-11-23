@@ -5,6 +5,12 @@
 #include "qemu/error-report.h"
 
 uint64_t quantum_size = 0;
+/*
+ * Simulated time a vCPU runs per turn when several vCPUs share a host thread
+ * (N:M time multiplexing): each quantum takes ceil(quantum / slice) rounds.
+ * Defaults to the quantum size (one turn per quantum, no interleaving).
+ */
+uint64_t quantum_slice_size = 0;
 uint64_t quantum_check_threshold = 0;
 bool quantum_allow_interrupt_wakeup_inside = 0; // allow interrupts and other `run_on_cpu` to wake up a thread that spins on the quantum barrier.
 bool quantum_rr_mode = false; // Enable quantum-rr mode (single-threaded with quantum)
@@ -54,6 +60,29 @@ void quantum_configure(QemuOpts *opts, Error **errp) {
             quantum_stats_dir = g_strdup(stats_dir);
         }
     }
+
+    uint64_t slice = qemu_opt_get_number(opts, "slice", 0);
+    if (slice == 0) {
+        slice = quantum_size_tmp;
+    }
+    if (quantum_size_tmp != 0) {
+        if (slice > quantum_size_tmp) {
+            error_report("quantum: slice=%" PRIu64 " ns is larger than size=%" PRIu64 " ns",
+                         slice, quantum_size_tmp);
+            exit(1);
+        }
+        if (DIV_ROUND_UP(quantum_size_tmp, slice) > 64) {
+            error_report("quantum: slice=%" PRIu64 " ns gives more than 64 rounds per quantum "
+                         "(size=%" PRIu64 " ns)", slice, quantum_size_tmp);
+            exit(1);
+        }
+        if (quantum_rr_mode && slice != quantum_size_tmp) {
+            /* The single-threaded quantum-rr loop runs every vCPU for a whole quantum. */
+            warn_report("quantum: slice=%" PRIu64 " is ignored with rr=on", slice);
+            slice = quantum_size_tmp;
+        }
+    }
+    quantum_slice_size = slice;
 
     // make it as a global value.
     quantum_size = quantum_size_tmp;

@@ -12,6 +12,7 @@ void quantum_configure(QemuOpts *opts, Error **errp);
 
 #ifdef CONFIG_TCG
 extern uint64_t quantum_size;
+extern uint64_t quantum_slice_size; /* time slice of the N:M scheduler (ns), <= quantum_size */
 extern uint64_t quantum_check_threshold;
 extern bool quantum_allow_interrupt_wakeup_inside;
 extern bool quantum_rr_mode;
