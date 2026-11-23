@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/cpu-context.h"
 #include "qemu/main-loop.h"
 #include "exec/cpu-common.h"
 #include "hw/core/cpu.h"
@@ -120,7 +121,7 @@ CPUState *qemu_get_cpu(int index)
     return NULL;
 }
 
-/* current CPU in the current thread. It is only valid inside cpu_exec() */
+/* Selected CPU during guest execution and CPU-specific work callbacks. */
 __thread CPUState *current_cpu;
 
 struct qemu_work_item {
@@ -145,8 +146,17 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
 {
     struct qemu_work_item wi;
 
+    if (cpu->worker_attached && current_cpu && current_cpu != cpu &&
+        current_cpu->exclusive_context_count) {
+        fprintf(stderr, "N worker: cross-CPU dispatch inside exclusive work is unsupported\n");
+        _exit(EXIT_FAILURE);
+    }
     if (qemu_cpu_is_self(cpu)) {
+        CPUState *saved_cpu;
+        saved_cpu = cpu_context_save(&current_cpu, cpu);
+
         func(cpu, data);
+        cpu_context_restore(&current_cpu, saved_cpu);
         return;
     }
 
@@ -341,9 +351,12 @@ void process_queued_cpu_work(CPUState *cpu)
         return;
     }
     while (!QSIMPLEQ_EMPTY(&cpu->work_list)) {
+        CPUState *saved_cpu;
+
         wi = QSIMPLEQ_FIRST(&cpu->work_list);
         QSIMPLEQ_REMOVE_HEAD(&cpu->work_list, node);
         qemu_mutex_unlock(&cpu->work_mutex);
+        saved_cpu = cpu_context_save(&current_cpu, cpu);
         if (wi->exclusive) {
             /* Running work items outside the BQL avoids the following deadlock:
              * 1) start_exclusive() is called with the BQL taken while another
@@ -359,6 +372,7 @@ void process_queued_cpu_work(CPUState *cpu)
         } else {
             wi->func(cpu, wi->data);
         }
+        cpu_context_restore(&current_cpu, saved_cpu);
         qemu_mutex_lock(&cpu->work_mutex);
         if (wi->free) {
             g_free(wi);

@@ -26,6 +26,8 @@
    this API directly.  */
 
 #include "qemu/osdep.h"
+#include "hw/core/cpu.h"
+#include "sysemu/quantum.h"
 #include "qapi/error.h"
 #include "qapi/qapi-events-qdev.h"
 #include "qapi/qmp/qdict.h"
@@ -483,6 +485,12 @@ static void device_set_realized(Object *obj, bool value, Error **errp)
         return;
     }
 
+    if (object_dynamic_cast(obj, TYPE_CPU) &&
+        ((CPU(obj)->worker_attached && !value) ||
+         (quantum_workers_enabled() && dev->hotplugged && value))) {
+        error_setg(errp, "worker CPU hotplug/unrealization is unsupported");
+        return;
+    }
     if (value && !dev->realized) {
         if (!check_only_migratable(obj, errp)) {
             goto fail;
@@ -606,6 +614,10 @@ static void device_set_realized(Object *obj, bool value, Error **errp)
     return;
 
 child_realize_fail:
+    if (object_dynamic_cast(obj, TYPE_CPU) && CPU(obj)->worker_attached) {
+        error_report("worker CPU realization failed; unsafe rollback prevented");
+        _exit(EXIT_FAILURE);
+    }
     QLIST_FOREACH(bus, &dev->child_bus, sibling) {
         qbus_unrealize(bus);
     }
@@ -615,6 +627,10 @@ child_realize_fail:
     }
 
 post_realize_fail:
+    if (object_dynamic_cast(obj, TYPE_CPU) && CPU(obj)->worker_attached) {
+        error_report("worker CPU realization failed; unsafe rollback prevented");
+        _exit(EXIT_FAILURE);
+    }
     g_free(dev->canonical_path);
     dev->canonical_path = NULL;
     if (dc->unrealize) {
@@ -622,6 +638,10 @@ post_realize_fail:
     }
 
 fail:
+    if (object_dynamic_cast(obj, TYPE_CPU) && CPU(obj)->worker_attached) {
+        error_report("worker CPU realization failed; unsafe rollback prevented");
+        _exit(EXIT_FAILURE);
+    }
     error_propagate(errp, local_err);
     if (unattached_parent) {
         /*

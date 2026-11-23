@@ -344,6 +344,7 @@ struct CPUState {
     struct QemuCond *halt_cond;
     bool thread_kicked;
     bool created;
+    bool worker_attached; /* Process-lifetime shared worker borrows this CPU. */
     bool stop;
     bool stopped;
 

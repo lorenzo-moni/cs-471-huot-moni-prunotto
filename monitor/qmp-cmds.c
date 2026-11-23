@@ -19,6 +19,7 @@
 #include "monitor/qdev.h"
 #include "monitor/qmp-helpers.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/quantum.h"
 #include "sysemu/kvm.h"
 #include "sysemu/runstate.h"
 #include "sysemu/runstate-action.h"

@@ -3,6 +3,7 @@
 #include "qemu/dynamic_barrier.h"
 
 uint64_t quantum_size = 0;
+uint64_t quantum_workers = 0;
 
 dynamic_barrier_polling_t quantum_barrier;
 

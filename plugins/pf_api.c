@@ -30,6 +30,9 @@
 #include "exec/cpu-common.h"
 #include "qemu/plugin-pf.h"
 #include "sysemu/quantum.h"
+#include "sysemu/runstate.h"
+#include "qemu/main-loop.h"
+#include "qemu/atomic.h"
 #include "migration/snapshot.h"
 #include "qapi/error.h"
 #include "hw/core/cpu.h"
@@ -205,10 +208,30 @@ uint64_t qemu_plugin_get_quantum_size(void) {
 
 void qemu_plugin_savevm(const char *name, qemu_plugin_snapshot_format_t format) {
   Error *err = NULL;
-  save_snapshot(name, true, NULL, false, NULL, (SnapshotFormat)format, &err);
+  bool saved;
+
+  if (quantum_workers_enabled()) {
+    g_assert(qemu_mutex_iothread_locked());
+    if (!quantum_worker_checkpoint_pending) {
+      error_report("N worker plugin save requires a global checkpoint boundary");
+      _exit(EXIT_FAILURE);
+    }
+
+  }
+  saved = save_snapshot(name, true, NULL, false, NULL, (SnapshotFormat)format, &err);
 
   if (err) {
     error_reportf_err(err, "Error: ");
+  }
+  if (quantum_workers_enabled()) {
+    if (!saved) {
+      error_report("N worker checkpoint capture failed: %s", name);
+      _exit(EXIT_FAILURE);
+    }
+    /* save_snapshot has finished QEMU and plugin capture and its resume. */
+    quantum_worker_checkpoint_pending = false;
+    fprintf(stderr, "N checkpoint complete generation=%u name=%s\n",
+            quantum_worker_generation, name);
   }
 }
 
@@ -273,6 +296,14 @@ bool qemu_plugin_register_plugin_quantum_generation_increment_variable(
     return false;
   }
 
+  if (quantum_workers_enabled()) {
+    if (!var || quantum_worker_plugin_generation) {
+      return false;
+    }
+    quantum_worker_plugin_generation = var;
+    qatomic_set(var, quantum_worker_generation);
+    return true;
+  }
   if (quantum_barrier.plugin_quantum_generation != NULL) {
     return false;
   }
@@ -303,6 +334,9 @@ bool qemu_plugin_register_record_statistics_cb(
 }
 
 uint32_t *qemu_plugin_get_global_quantum_generation_ptr(void) {
+  if (quantum_workers_enabled()) {
+    return &quantum_worker_generation;
+  }
   return &quantum_barrier.return_value.two_32.generation;
 }
 

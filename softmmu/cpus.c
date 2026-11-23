@@ -437,6 +437,28 @@ static uint64_t get_current_timestamp_ns(void) {
     return timestamp_ns;
 }
 
+void qemu_account_quantum_idle(CPUState *cpu)
+{
+    // record the idle time.
+    record_statistics_to_plugin(cpu->cpu_index, 4, cpu->quantum_budget_in_picosecond / 1000);
+    /* qstats: the unused budget is the simulated time spent in WFI. */
+    if (cpu->quantum_budget_in_picosecond > 0) {
+        cpu->qstats_wfi_ps += cpu->quantum_budget_in_picosecond;
+    }
+    cpu->qstats_idle_entries++;
+    /*
+     * first_cpu is the timekeeper: bank the unused (idle) portion
+     * of its budget into the virtual clock so time keeps advancing
+     * while first_cpu is halted, and run any timer now due.  The
+     * BQL is held here, so quantum_run_due_timers() won't relock.
+     */
+    if (cpu == first_cpu && cpu->quantum_budget_in_picosecond > 0) {
+        advance_quantum_time_ps(cpu->quantum_budget_in_picosecond);
+        quantum_run_due_timers();
+    }
+    cpu->quantum_budget_depleted = 1;
+}
+
 void qemu_wait_io_event(CPUState *cpu)
 {
     bool slept = false;
@@ -467,24 +489,7 @@ void qemu_wait_io_event(CPUState *cpu)
             // CPU is running normally (not being asked to stop).
             bool affiliated_with_quantum = cpu->ip100ns != 0 && quantum_enabled();
             if (affiliated_with_quantum) {
-                // record the idle time.
-                record_statistics_to_plugin(cpu->cpu_index, 4, cpu->quantum_budget_in_picosecond / 1000);
-                /* qstats: the unused budget is the simulated time spent in WFI. */
-                if (cpu->quantum_budget_in_picosecond > 0) {
-                    cpu->qstats_wfi_ps += cpu->quantum_budget_in_picosecond;
-                }
-                cpu->qstats_idle_entries++;
-                /*
-                 * first_cpu is the timekeeper: bank the unused (idle) portion
-                 * of its budget into the virtual clock so time keeps advancing
-                 * while first_cpu is halted, and run any timer now due.  The
-                 * BQL is held here, so quantum_run_due_timers() won't relock.
-                 */
-                if (cpu == first_cpu && cpu->quantum_budget_in_picosecond > 0) {
-                    advance_quantum_time_ps(cpu->quantum_budget_in_picosecond);
-                    quantum_run_due_timers();
-                }
-                cpu->quantum_budget_depleted = 1;
+                qemu_account_quantum_idle(cpu);
                 break; // we need to break in order to wait for the barrier.
             } else {
                 qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
@@ -631,7 +636,8 @@ void pause_all_vcpus(void)
 
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false);
 
-    if (quantum_enabled() && !quantum_rr_enabled()) {
+    if (quantum_enabled() && !quantum_rr_enabled() &&
+        !quantum_workers_enabled()) {
         // In quantum mode, set a flag in the barrier so all vCPUs will pause
         // together at the end of the current quantum, instead of sending
         // individual pause requests that would be polled inefficiently.
@@ -690,12 +696,29 @@ void resume_all_vcpus(void)
 
 void cpu_remove_sync(CPUState *cpu)
 {
+    if (cpu->worker_attached) {
+        error_report("worker CPU removal is unsupported");
+        _exit(EXIT_FAILURE);
+    }
     cpu->stop = true;
     cpu->unplug = true;
     qemu_cpu_kick(cpu);
     qemu_mutex_unlock_iothread();
     qemu_thread_join(cpu->thread);
     qemu_mutex_lock_iothread();
+}
+
+bool qemu_worker_standalone;
+
+void cpus_worker_startup_complete(void)
+{
+    Error *err = NULL;
+
+    if (cpus_accel->worker_startup_complete &&
+        !cpus_accel->worker_startup_complete(&err)) {
+        error_report_err(err);
+        _exit(EXIT_FAILURE);
+    }
 }
 
 void cpus_register_accel(const AccelOpsClass *ops)
@@ -733,8 +756,19 @@ void qemu_init_vcpu(CPUState *cpu)
     g_assert(cpus_accel != NULL && cpus_accel->create_vcpu_thread != NULL);
     cpus_accel->create_vcpu_thread(cpu);
 
-    while (!cpu->created) {
-        qemu_cond_wait(&qemu_cpu_cond, &qemu_global_mutex);
+    if (quantum_workers_enabled()) {
+        int64_t deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+        while (!cpu->created) {
+            if (g_get_monotonic_time() >= deadline) {
+                error_report("worker 0 timed out acknowledging CPU %d", cpu->cpu_index);
+                _exit(EXIT_FAILURE);
+            }
+            qemu_cond_timedwait_iothread(&qemu_cpu_cond, 100);
+        }
+    } else {
+        while (!cpu->created) {
+            qemu_cond_wait(&qemu_cpu_cond, &qemu_global_mutex);
+        }
     }
 }
 

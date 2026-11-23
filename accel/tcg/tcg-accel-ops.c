@@ -30,6 +30,7 @@
 #include "sysemu/replay.h"
 #include "sysemu/cpu-timers.h"
 #include "sysemu/quantum.h"
+#include "sysemu/quantum-stats.h"
 #include "sysemu/asid-coeff.h"
 #include "qemu/main-loop.h"
 #include "qemu/guest-random.h"
@@ -44,6 +45,7 @@
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
 #include "tcg-accel-ops-quantum.h"
+#include "quantum-worker-creation.h"
 #include "tcg-accel-ops-quantum-rr.h"
 
 /* common functionality among all TCG variants */
@@ -193,7 +195,13 @@ static inline void tcg_remove_all_breakpoints(CPUState *cpu)
 
 static void tcg_accel_ops_init(AccelOpsClass *ops)
 {
-    if (quantum_enabled() && quantum_rr_enabled()) {
+    if (quantum_workers_enabled()) {
+        qstats_global_init();
+        ops->create_vcpu_thread = quantum_worker_creation_attach;
+        ops->kick_vcpu_thread = quantum_worker_creation_kick;
+        ops->handle_interrupt = tcg_handle_interrupt;
+        ops->worker_startup_complete = quantum_worker_creation_seal;
+    } else if (quantum_enabled() && quantum_rr_enabled()) {
         /* Quantum-RR mode: single-threaded round-robin with quantum */
         ops->create_vcpu_thread = quantum_rr_start_vcpu_thread;
         ops->kick_vcpu_thread = quantum_rr_kick_vcpu_thread;
@@ -344,7 +352,19 @@ void tcg_parse_core_info_file(const char *file_name, core_meta_info_t *core_info
             fclose(fp);
             exit(1);
         }
-        double ipns = strtod(token, NULL);
+        char *number_end;
+        double ipns = strtod(token, &number_end);
+        bool number_valid = number_end != token;
+        if (quantum_workers_enabled()) {
+            while (g_ascii_isspace(*number_end)) {
+                number_end++;
+            }
+            if (!number_valid || *number_end || !isfinite(ipns)) {
+                fprintf(stderr, "Error: worker timing row %d: invalid ipns\n", core_id);
+                fclose(fp);
+                exit(1);
+            }
+        }
         if (ipns < 0) {
             fprintf(stderr, "Error: Row %d: ipns must be non-negative, got %f\n", core_id, ipns);
             fclose(fp);
@@ -398,7 +418,20 @@ void tcg_parse_core_info_file(const char *file_name, core_meta_info_t *core_info
                     fclose(fp);
                     exit(1);
                 }
-                double val = strtod(token, NULL);
+                double val = strtod(token, &number_end);
+                number_valid = number_end != token;
+                if (quantum_workers_enabled()) {
+                    while (g_ascii_isspace(*number_end)) {
+                        number_end++;
+                    }
+                    if (!number_valid || *number_end || !isfinite(val) ||
+                        val < 0 || val * 1000.0 + 0.5 >= (double)UINT32_MAX + 1.0) {
+                        fprintf(stderr, "Error: worker timing row %d: invalid %s\n",
+                                core_id, coeff_names[i]);
+                        fclose(fp);
+                        exit(1);
+                    }
+                }
                 if (val < 0) {
                     fprintf(stderr, "Error: Row %d: %s must be non-negative, got %f\n",
                             core_id, coeff_names[i], val);

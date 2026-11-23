@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu-main.h"
+#include "sysemu/cpus.h"
 #include "sysemu/sysemu.h"
 
 #ifdef CONFIG_SDL
@@ -44,6 +45,7 @@ int (*qemu_main)(void) = qemu_default_main;
 
 int main(int argc, char **argv)
 {
+    qemu_worker_standalone = (qemu_main == qemu_default_main);
     qemu_init(argc, argv);
     return qemu_main();
 }

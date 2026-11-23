@@ -1,6 +1,9 @@
 #ifndef QEMU_CPUS_H
 #define QEMU_CPUS_H
 
+extern bool qemu_worker_standalone;
+void cpus_worker_startup_complete(void);
+
 #include "sysemu/accel-ops.h"
 
 /* register accel-specific operations */
@@ -25,6 +28,20 @@ bool cpu_thread_is_idle(CPUState *cpu);
 bool all_cpu_threads_idle(void);
 bool cpu_can_run(CPUState *cpu);
 void qemu_wait_io_event_common(CPUState *cpu);
+/*
+ * Account one quantum idle event after the caller has selected the idle path
+ * for a quantum-managed CPU (quantum enabled, ip100ns != 0, not stopped or
+ * stopping). Call on the owning CPU thread with current_cpu == cpu and the
+ * BQL held; no additional lock is required. The BQL remains held on return.
+ *
+ * Records plugin/qstats idle time, advances first_cpu's clock and runs due
+ * timers for a positive budget, then sets quantum_budget_depleted. Does not
+ * directly change the budget, generation or halted state, wait at a barrier,
+ * or emit idle/resume callbacks. Timer callbacks may wake CPUs or queue work.
+ * Not idempotent: the caller must not account the same idle remainder twice.
+ */
+void qemu_account_quantum_idle(CPUState *cpu);
+
 void qemu_wait_io_event(CPUState *cpu); 
 void cpu_thread_signal_created(CPUState *cpu);
 void cpu_thread_signal_destroyed(CPUState *cpu);

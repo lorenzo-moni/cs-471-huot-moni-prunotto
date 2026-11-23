@@ -48,6 +48,7 @@
 #include "qapi/qapi-builtin-visit.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/error-report.h"
+#include "sysemu/quantum.h"
 #include "sysemu/cpus.h"
 #include "exec/memory.h"
 #include "exec/ramblock.h"
@@ -2983,6 +2984,13 @@ static bool is_incremental_format(SnapshotFormat format)
 bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
                   bool has_devices, strList *devices, SnapshotFormat format, Error **errp)
 {
+#ifdef CONFIG_TCG
+    if (quantum_workers_enabled() && !quantum_worker_checkpoint_pending) {
+        error_setg(errp, "N worker snapshots require the periodic global barrier");
+        return false;
+    }
+#endif
+
     BlockDriverState *bs;
     QEMUSnapshotInfo sn1, *sn = &sn1;
     int ret = -1, ret2;
@@ -3048,6 +3056,19 @@ bool save_snapshot(const char *name, bool overwrite, const char *vmstate,
     global_state_store();
     vm_stop(RUN_STATE_SAVE_VM);
 
+#ifdef CONFIG_TCG
+    if (quantum_workers_enabled()) {
+        CPUState *cpu;
+        CPU_FOREACH(cpu) {
+            if (!cpu->stopped || cpu->running || !cpu->waiting_for_quantum ||
+                cpu->quantum_generation != quantum_worker_generation) {
+                error_setg(errp, "N checkpoint quiescence failed at CPU %d",
+                           cpu->cpu_index);
+                return false;
+            }
+        }
+    }
+#endif
     bdrv_drain_all_begin();
 
     aio_context_acquire(aio_context);
@@ -3476,6 +3497,13 @@ static void *uffd_on_demand_thread(void *main_ram)
 bool load_snapshot(const char *name, const char *vmstate,
                    bool has_devices, strList *devices, int on_demand, Error **errp)
 {
+#ifdef CONFIG_TCG
+    if (quantum_workers_enabled() && quantum_worker_execution_started) {
+        error_setg(errp, "N worker snapshot load requires a fresh process before cont");
+        return false;
+    }
+#endif
+
     BlockDriverState *bs_vm_state;
     QEMUSnapshotInfo sn;
     QEMUFile *f;

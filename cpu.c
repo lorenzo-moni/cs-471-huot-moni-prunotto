@@ -170,6 +170,10 @@ void cpu_exec_realizefn(CPUState *cpu, Error **errp)
 
 void cpu_exec_unrealizefn(CPUState *cpu)
 {
+    if (cpu->worker_attached) {
+        error_report("cannot unrealize a process-lifetime worker CPU");
+        _exit(EXIT_FAILURE);
+    }
 #ifndef CONFIG_USER_ONLY
     CPUClass *cc = CPU_GET_CLASS(cpu);
 

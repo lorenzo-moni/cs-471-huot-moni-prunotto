@@ -24,6 +24,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
+#include <math.h>
 #include "sysemu/cpus.h"
 #include "sysemu/runstate.h"
 #include "sysemu/tcg.h"
@@ -93,7 +95,7 @@ typedef enum {
 } QSyncResult;
 
 /* Waits at the global barrier. Returns the new barrier generation. */
-static uint32_t quantum_host_barrier_wait(CPUState *cpu, int *stop_request)
+uint32_t quantum_host_barrier_wait(CPUState *cpu, int *stop_request)
 {
     *stop_request = 0;
     qstats_barrier_enter();
@@ -106,7 +108,7 @@ static uint32_t quantum_host_barrier_wait(CPUState *cpu, int *stop_request)
 }
 
 /* Moves @cpu to the next quantum after the barrier returned @new_generation. */
-static void quantum_vcpu_advance(CPUState *cpu, uint32_t new_generation,
+void quantum_vcpu_advance(CPUState *cpu, uint32_t new_generation,
                                  int stop_request, bool from_idle)
 {
     uint32_t old_generation_low_32bit = cpu->quantum_generation & 0xFFFFFFFF;
@@ -172,6 +174,78 @@ static QSyncResult quantum_sync_to_next(CPUState *cpu, bool from_idle)
     return QSYNC_NEXT;
 }
 
+/* Worker-only validation: legacy CPUs may intentionally have zero IPNS. */
+bool quantum_vcpu_validate_model(CPUState *cpu, Error **errp)
+{
+    double ipns, scaled;
+
+    if (cpu->cpu_index < 0 ||
+        (unsigned int)cpu->cpu_index >= G_N_ELEMENTS(core_info_table)) {
+        error_setg(errp, "worker CPU %d: no timing-model entry", cpu->cpu_index);
+        return false;
+    }
+    ipns = core_info_table[cpu->cpu_index].ipns;
+    scaled = ipns * 100.0;
+    /* Check before floating-to-integer conversion, including its upper bound. */
+    if (!isfinite(scaled) || scaled < 1.0 || scaled >= 0x1p64) {
+        error_setg(errp, "worker CPU %d: missing or invalid timing model "
+                   "(IPNS must produce a nonzero uint64 ip100ns)",
+                   cpu->cpu_index);
+        return false;
+    }
+    if (!core_model_is_constant(&core_info_table[cpu->cpu_index]) &&
+        fabs(ipns - 1.0) > 1e-9) {
+        error_setg(errp, "worker CPU %d: ipc-model requires ipns=1.0",
+                   cpu->cpu_index);
+        return false;
+    }
+    return true;
+}
+
+/* Initialize the supplied CPU from the configured core-info table. */
+void quantum_vcpu_init_model(CPUState *cpu)
+{
+    // Copy core info from table to CPUState
+    cpu->ip100ns = (uint64_t)(core_info_table[cpu->cpu_index].ipns * 100);
+    cpu->active_coeffs = core_info_table[cpu->cpu_index].coeffs;
+
+    /* Record whether this is an ipc-model core (enables ASID switching). */
+    cpu->is_ipc_model = !core_model_is_constant(&core_info_table[cpu->cpu_index]);
+
+    /* Save defaults so the TTBR handler can fall back to them. */
+    cpu->default_coeffs = cpu->active_coeffs;
+}
+
+/* Per-vCPU fields only; call before publishing the CPU as created. */
+void quantum_vcpu_init_time_state(CPUState *cpu)
+{
+    // initialize the field that are related to the time.
+    cpu->unknown_time = 0;
+    cpu->enter_idle_time = 0;
+    cpu->target_cycle_on_idle = 0;
+    cpu->target_cycle_on_instruction = 0;
+    cpu->touched_timer_during_last_quantum = 0;
+
+    cpu->sgi_sender_time_ns_valid = false;
+    cpu->sgi_sender_remaining_time_ns = 0;
+    cpu->sgi_sender_quantum_generation = 0;
+
+    cpu->waiting_for_quantum = 0;
+    cpu->wakeup_during_quantum_spinning = 0;
+    cpu->wakeup_while_given_ts_is_smaller_than_before = 0;
+}
+
+/* The caller supplies the generation; this does not register a participant. */
+void quantum_vcpu_init_budget(CPUState *cpu, uint32_t generation)
+{
+    cpu->quantum_generation = generation;
+    /* Budget is always in picoseconds: quantum_size (ns) * 1000 = ps. */
+    cpu->quantum_budget_in_picosecond = (int64_t)quantum_size * 1000;
+    assert(cpu->quantum_budget_in_picosecond > 0);
+    cpu->last_tb_instruction_count_for_quantum = 0;
+    cpu->quantum_budget_depleted = 0;
+}
+
 /*
  * In the multi-threaded case each vCPU has its own thread. The TLS
  * variable current_cpu can be used deep in the code to find the
@@ -183,15 +257,7 @@ static void *mttcg_cpu_thread_fn(void *arg)
     MttcgForceRcuNotifier force_rcu;
     CPUState *cpu = arg;
 
-    // Copy core info from table to CPUState
-    cpu->ip100ns = (uint64_t)(core_info_table[cpu->cpu_index].ipns * 100);
-    cpu->active_coeffs = core_info_table[cpu->cpu_index].coeffs;
-
-    /* Record whether this is an ipc-model core (enables ASID switching). */
-    cpu->is_ipc_model = !core_model_is_constant(&core_info_table[cpu->cpu_index]);
-
-    /* Save defaults so the TTBR handler can fall back to them. */
-    cpu->default_coeffs = cpu->active_coeffs;
+    quantum_vcpu_init_model(cpu);
 
     assert(tcg_enabled());
     g_assert(!icount_enabled());
@@ -208,30 +274,13 @@ static void *mttcg_cpu_thread_fn(void *arg)
     cpu->thread_id = qemu_get_thread_id();
     cpu->can_do_io = 1;
 
-    // initialize the field that are related to the time.
-    cpu->unknown_time = 0;
-    cpu->enter_idle_time = 0;
-    cpu->target_cycle_on_idle = 0;
-    cpu->target_cycle_on_instruction = 0;
-    cpu->touched_timer_during_last_quantum = 0;
-
-    cpu->sgi_sender_time_ns_valid = false;
-    cpu->sgi_sender_remaining_time_ns = 0;
-    cpu->sgi_sender_quantum_generation = 0;
-
-    cpu->waiting_for_quantum = 0;
-    cpu->wakeup_during_quantum_spinning = 0;
-    cpu->wakeup_while_given_ts_is_smaller_than_before = 0;
+    quantum_vcpu_init_time_state(cpu);
 
     bool affiliated_with_quantum = cpu->ip100ns && quantum_enabled();
     assert(affiliated_with_quantum);
 
-    cpu->quantum_generation = dynamic_barrier_polling_increase_by_1(&quantum_barrier);
-    /* Budget is always in picoseconds: quantum_size (ns) * 1000 = ps. */
-    cpu->quantum_budget_in_picosecond = (int64_t)quantum_size * 1000;
-    assert(cpu->quantum_budget_in_picosecond > 0);
-    cpu->last_tb_instruction_count_for_quantum = 0;
-    cpu->quantum_budget_depleted = 0;
+    quantum_vcpu_init_budget(cpu,
+        dynamic_barrier_polling_increase_by_1(&quantum_barrier));
 
     qemu_log("======================================\n");
     qemu_log("Core%u Quantum Count: %lu ns.\n", cpu->cpu_index, quantum_size);

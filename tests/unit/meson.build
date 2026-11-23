@@ -49,6 +49,9 @@ tests = {
   'ptimer-test': ['ptimer-test-stubs.c', meson.project_source_root() / 'hw/core/ptimer.c'],
   'test-qapi-util': [],
   'test-interval-tree': [],
+  'test-cpu-context': [],
+  'test-quantum-worker-barrier': [meson.project_source_root() / 'accel/tcg/quantum-worker-barrier.c'],
+  'test-quantum-worker-map': [meson.project_source_root() / 'accel/tcg/quantum-worker-map.c'],
   'test-xs-node': [qom],
 }
 
@@ -170,6 +173,8 @@ test_env.set('G_TEST_SRCDIR', meson.current_source_dir())
 test_env.set('G_TEST_BUILDDIR', meson.current_build_dir())
 
 slow_tests = {
+  'test-cpu-context': 15,
+  'test-quantum-worker-barrier': 90,
   'test-crypto-tlscredsx509': 45,
   'test-crypto-tlssession': 45
 }

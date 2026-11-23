@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/cpu.h"
 #include "qemu/help-texts.h"
 #include "qemu/datadir.h"
 #include "qemu/units.h"
@@ -160,6 +161,7 @@ typedef struct DeviceOption {
 static const char *cpu_option;
 static const char *mem_path;
 static const char *incoming;
+static bool worker_seed_requested;
 static const char *loadvm;
 static int loadvm_on_demand = 0;
 static const char *accelerators;
@@ -469,6 +471,10 @@ static QemuOptsList qemu_quantum_opts = {
     .merge_lists = true,
     .head = QTAILQ_HEAD_INITIALIZER(qemu_quantum_opts.head),
     .desc = {
+        {
+            .name = "workers",
+            .type = QEMU_OPT_NUMBER,
+        },
         {
             .name = "size",
             .type = QEMU_OPT_NUMBER,
@@ -2683,6 +2689,7 @@ static void qemu_machine_creation_done(void)
     qdev_prop_check_globals();
 
     qdev_machine_creation_done();
+    cpus_worker_startup_complete();
 
     if (machine->cgs) {
         /*
@@ -3040,6 +3047,7 @@ void qemu_init(int argc, char **argv)
                 break;
 #endif
             case QEMU_OPTION_seed:
+                worker_seed_requested = true;
                 qemu_guest_random_seed_main(optarg, &error_fatal);
                 break;
             case QEMU_OPTION_s:
@@ -3692,6 +3700,19 @@ void qemu_init(int argc, char **argv)
      * after qemu_apply_machine_options.
      */
     configure_accelerators(argv[0]);
+    if (quantum_workers_enabled() &&
+        (!qemu_worker_standalone || !tcg_enabled() ||
+         !qemu_tcg_mttcg_enabled() || icount_enabled() ||
+         strcmp(target_name(), "aarch64") ||
+         !g_str_has_prefix(object_get_typename(OBJECT(current_machine)), "virt-") ||
+         current_machine->smp.cpus != 2 * quantum_workers ||
+         current_machine->smp.max_cpus != current_machine->smp.cpus ||
+         autostart || worker_seed_requested || incoming ||
+         replay_mode != REPLAY_MODE_NONE)) {
+        error_report("workers require standalone AArch64 virt, MTTCG, "
+                     "N=2*M, maxcpus=N, -S, no seed, incoming migration or replay");
+        exit(EXIT_FAILURE);
+    }
     phase_advance(PHASE_ACCEL_CREATED);
 
     /*
