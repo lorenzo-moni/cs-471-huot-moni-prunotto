@@ -14,7 +14,10 @@
  * the thread that releases the barrier, and the OS context switches of the
  * quantum. For each target core it runs, it records the instructions executed,
  * the simulated time consumed by them and given up in WFI, the host time spent
- * executing it, and its BQL and WFE/YIELD activity.
+ * executing it, its BQL and WFE/YIELD activity, and its late wake-ups:
+ * interrupts that would wake it while it is idle until the next quantum,
+ * classified by the sender (a vCPU of the same host thread, of another host
+ * thread, or no vCPU).
  *
  * Output (in <dir>):
  *   host_<tid>.csv  one row per quantum per host thread  (QStatsHostRec)
@@ -35,8 +38,12 @@
  * buffers are written under a lock and nothing is written after the files are
  * closed. All hooks are no-ops when stats are disabled (qstats_self == NULL).
  *
- * The bookkeeping is per *host thread*: today a host thread runs exactly one
- * vCPU (r = 1), with time multiplexing it runs several.
+ * The bookkeeping is per *host thread*, which runs one vCPU or, with N:M time
+ * multiplexing, several (the vCPUs sharing a host_core_idx in core_info.csv).
+ * With several vCPUs, ctx_switch is the time the scheduler spends switching
+ * between them: from the start of a vCPU's turn to the start of its execution,
+ * BQL waits excluded. Refilling the host caches after a switch is part of
+ * exec / host_exec_ns, not of ctx_switch.
  */
 
 #ifndef SYSEMU_QUANTUM_STATS_H
@@ -61,6 +68,14 @@ struct CPUState;
   (1u << 3) /* the thread wrote its buffers just before this quantum */
 #define QSTATS_RESUMED                                                         \
   (1u << 4) /* first quantum after the VM was (re)started */
+
+/* Most vCPUs run by one host thread that threads.csv lists. */
+#define QSTATS_MAX_THREAD_VCPUS 32
+
+/* Sender classes of the late wake-ups (CPUState.qstats_late_wake[]). */
+#define QSTATS_WAKE_SIBLING 0 /* a vCPU of the same host thread */
+#define QSTATS_WAKE_REMOTE 1  /* a vCPU of another host thread */
+#define QSTATS_WAKE_OTHER 2   /* no vCPU: device model, main loop, iothread */
 
 /*
  * One row of host_<tid>.csv. Host times are CLOCK_MONOTONIC_RAW nanoseconds,
@@ -105,6 +120,10 @@ typedef struct QStatsVcpuRec {
   uint32_t idle_entries;
   uint32_t bql_acq;     /* BQL acquisitions outside the barrier */
   uint32_t yield_exits; /* TCG exits with EXCP_YIELD (WFE/YIELD) */
+  /* Interrupts that would wake it while idle until the next quantum, by sender. */
+  uint32_t late_wake_sibling; /* a vCPU of the same host thread */
+  uint32_t late_wake_remote;  /* a vCPU of another host thread */
+  uint32_t late_wake_other;   /* no vCPU (device model, main loop) */
 } QStatsVcpuRec;
 
 typedef struct QStatsHost {
@@ -121,6 +140,7 @@ typedef struct QStatsHost {
   uint64_t cpu_start;
   uint64_t cpu_bar_enter;
   uint64_t ctx_acc;
+  uint64_t ctx_bql_acc; /* BQL waits inside the current ctx window */
   uint64_t bql_acc;
   uint64_t barrier_bql_acc;
   uint64_t release_ns;
@@ -130,7 +150,12 @@ typedef struct QStatsHost {
   uint32_t pending_flags;
   bool in_barrier;
   bool in_exec;
+  bool in_ctx;
   bool need_restart;
+
+  /* vCPUs run by the thread, for threads.csv (owner thread, before the VM runs). */
+  int n_vcpus;
+  int vcpu_idx[QSTATS_MAX_THREAD_VCPUS];
 
   /*
    * Record buffers, filled by the owner thread only. hlen/vlen are
@@ -245,17 +270,34 @@ void qstats_exec_end(struct CPUState *cpu);
  */
 void qstats_vcpu_end_quantum(struct CPUState *cpu, uint64_t generation);
 
-/* Around a switch between co-located vCPUs (time multiplexing). */
+/*
+ * Around a switch between co-located vCPUs (time multiplexing): from the start
+ * of a vCPU's turn to the start of its execution. BQL waits inside the window
+ * are already counted in bql_wait_ns, so they are left out of ctx_switch_ns.
+ */
 static inline void qstats_ctx_begin(void) {
-  if (qstats_self) {
-    qstats_self->t_ctx_start = qstats_now_ns();
+  QStatsHost *s = qstats_self;
+  if (s) {
+    s->t_ctx_start = qstats_now_ns();
+    s->ctx_bql_acc = 0;
+    s->in_ctx = true;
   }
 }
 static inline void qstats_ctx_end(void) {
-  if (qstats_self) {
-    qstats_self->ctx_acc += qstats_now_ns() - qstats_self->t_ctx_start;
-    qstats_self->n_switches++;
+  QStatsHost *s = qstats_self;
+  if (s) {
+    uint64_t d = qstats_now_ns() - s->t_ctx_start;
+    s->ctx_acc += d > s->ctx_bql_acc ? d - s->ctx_bql_acc : 0;
+    s->n_switches++;
+    s->in_ctx = false;
   }
 }
+
+/*
+ * Late wake-ups. True once qstats_global_init() ran: tcg_handle_interrupt()
+ * then calls qstats_note_interrupt() (BQL held) for every interrupt it delivers.
+ */
+extern bool qstats_late_wake_on;
+void qstats_note_interrupt(struct CPUState *target);
 
 #endif /* SYSEMU_QUANTUM_STATS_H */

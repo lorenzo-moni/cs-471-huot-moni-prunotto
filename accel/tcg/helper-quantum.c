@@ -112,9 +112,20 @@ uint32_t HELPER(check_and_deduce_quantum)(CPUArchState *env) {
      */
     quantum_flush_current_stats(current_cpu);
 
-    if (current_cpu->quantum_budget_in_picosecond <= 0) {
+    /*
+     * End of the vCPU's time slice: the budget fell to the slice floor, which
+     * is 0 when the slice is the whole quantum (always in rr mode).
+     */
+    if (current_cpu->quantum_budget_in_picosecond <= current_cpu->quantum_slice_floor_ps) {
         current_cpu->quantum_budget_depleted = 1;
-        current_cpu->vts = (current_cpu->quantum_generation + 1) * quantum_size;
+        if (current_cpu->quantum_budget_in_picosecond <= 0) {
+            /*
+             * The quantum is used up. Only then does the vCPU's time move to
+             * the end of the quantum: at the end of an inner slice vts keeps
+             * the vCPU's real progress.
+             */
+            current_cpu->vts = (current_cpu->quantum_generation + 1) * quantum_size;
+        }
         return true;
     }
     return false;
